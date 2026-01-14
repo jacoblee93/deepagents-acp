@@ -4,6 +4,7 @@ import asyncio
 import json
 from typing import Any
 from uuid import uuid4
+from deepagents.graph import Checkpointer
 from dotenv import load_dotenv
 
 from acp import (
@@ -11,6 +12,7 @@ from acp import (
     InitializeResponse,
     NewSessionResponse,
     PromptResponse,
+    SetSessionModeResponse,
     run_agent,
     text_block,
     update_agent_message,
@@ -29,9 +31,13 @@ from acp.schema import (
     ImageContentBlock,
     Implementation,
     McpServerStdio,
+    PermissionOption,
     ResourceContentBlock,
+    SessionMode,
+    SessionModeState,
     SseMcpServer,
     TextContentBlock,
+    ToolCallUpdate,
 )
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
@@ -47,10 +53,24 @@ class ACPDeepAgent(ACPAgent):
 
     _deepagent: Runnable
     _root_dir: str
+    _checkpointer: Checkpointer
+    _mode: str
 
-    def __init__(self, deepagent: Runnable, root_dir: str):
-        self._deepagent = deepagent
+    def __init__(
+        self,
+        root_dir: str,
+        checkpointer: Checkpointer,
+        mode: str,
+        interrupt_config: dict,
+    ):
         self._root_dir = root_dir
+        self._checkpointer = checkpointer
+        self._mode = mode
+        self._deepagent = create_deep_agent(
+            checkpointer=checkpointer,
+            backend=FilesystemBackend(root_dir=root_dir, virtual_mode=True),
+            interrupt_on=interrupt_config,
+        )
         super().__init__()
 
     def on_connect(self, conn: Client) -> None:
@@ -71,7 +91,55 @@ class ACPDeepAgent(ACPAgent):
         mcp_servers: list[HttpMcpServer | SseMcpServer | McpServerStdio],
         **kwargs: Any,
     ) -> NewSessionResponse:
-        return NewSessionResponse(session_id=uuid4().hex)
+        # Define available modes
+        available_modes = [
+            SessionMode(
+                id="default",
+                name="Default",
+                description="Ask permission before edits and writes",
+            ),
+            SessionMode(
+                id="auto",
+                name="Full Auto",
+                description="Never ask for permission",
+            ),
+        ]
+
+        return NewSessionResponse(
+            session_id=uuid4().hex,
+            modes=SessionModeState(
+                available_modes=available_modes,
+                current_mode_id="default",
+            ),
+        )
+
+    async def set_session_mode(
+        self,
+        mode_id: str,
+        session_id: str,
+        **kwargs: Any,
+    ) -> SetSessionModeResponse:
+        # Map mode IDs to interrupt configurations
+        mode_to_interrupt = {
+            "default": {
+                "edit_file": {"allowed_decisions": ["approve", "edit", "reject"]},
+                "write_file": {"allowed_decisions": ["approve", "edit", "reject"]},
+            },
+            "auto": None,  # No interrupts, full auto
+        }
+
+        interrupt_config = mode_to_interrupt.get(mode_id)
+
+        # Recreate the deep agent with new interrupt config
+        self._deepagent = create_deep_agent(
+            checkpointer=self._checkpointer,
+            backend=FilesystemBackend(root_dir=self._root_dir, virtual_mode=True),
+            interrupt_on=interrupt_config,
+        )
+
+        self._current_mode = mode_id
+
+        return SetSessionModeResponse()
 
     async def prompt(
         self,
@@ -207,92 +275,97 @@ class ACPDeepAgent(ACPAgent):
                     # Accumulate args string chunks using index
                     if chunk_args and chunk_index in tool_call_accumulator:
                         tool_call_accumulator[chunk_index]["args_str"] += chunk_args
-            # After processing chunks, try to start any tool calls with complete args
-            for index, acc in tool_call_accumulator.items():
-                tool_id = acc.get("id")
-                tool_name = acc.get("name")
-                args_str = acc.get("args_str", "")
 
-                # Only start if we haven't started yet and have parseable args
-                if tool_id and tool_id not in active_tool_calls and args_str:
-                    try:
-                        tool_args = json.loads(args_str)
+                # After processing chunks, try to start any tool calls with complete args
+                for index, acc in tool_call_accumulator.items():
+                    tool_id = acc.get("id")
+                    tool_name = acc.get("name")
+                    args_str = acc.get("args_str", "")
 
-                        # Mark as started
-                        active_tool_calls[tool_id] = {"name": tool_name}
+                    # Only start if we haven't started yet and have parseable args
+                    if tool_id and tool_id not in active_tool_calls and args_str:
+                        try:
+                            tool_args = json.loads(args_str)
 
-                        kind_map: dict = {
-                            "read_file": "read",
-                            "edit_file": "edit",
-                            "write_file": "edit",
-                            "ls": "search",
-                            "glob": "search",
-                            "grep": "search",
-                        }
-                        tool_kind = kind_map.get(tool_name, "other")
+                            # Mark as started
+                            active_tool_calls[tool_id] = {"name": tool_name}
 
-                        # Determine title based on tool type and args
-                        if tool_name == "read_file" and isinstance(tool_args, dict):
-                            path = tool_args.get("file_path")
-                            title = f"Read `{path}`" if path else tool_name
-                            update = start_tool_call(
-                                tool_call_id=tool_id,
-                                title=title,
-                                kind=tool_kind,
-                                status="pending",
-                            )
-                        elif tool_name == "edit_file" and isinstance(tool_args, dict):
-                            path = tool_args.get("file_path", "")
-                            old_string = tool_args.get("old_string", "")
-                            new_string = tool_args.get("new_string", "")
-                            title = f"Edit `{path}`" if path else tool_name
+                            kind_map: dict = {
+                                "read_file": "read",
+                                "edit_file": "edit",
+                                "write_file": "edit",
+                                "ls": "search",
+                                "glob": "search",
+                                "grep": "search",
+                            }
+                            tool_kind = kind_map.get(tool_name, "other")
 
-                            # Only create diff if we have both old and new strings
-                            if path and old_string and new_string:
-                                diff_content = tool_diff_content(
-                                    path=path,
-                                    new_text=new_string,
-                                    old_text=old_string,
-                                )
-                                update = start_edit_tool_call(
-                                    tool_call_id=tool_id,
-                                    title=title,
-                                    path=path,
-                                    content=diff_content,
-                                    # This is silly but for some reason content isn't passed through
-                                    extra_options=[diff_content],
-                                )
-                            else:
-                                # Fallback to generic tool call if data incomplete
+                            # Determine title based on tool type and args
+                            if tool_name == "read_file" and isinstance(tool_args, dict):
+                                path = tool_args.get("file_path")
+                                title = f"Read `{path}`" if path else tool_name
                                 update = start_tool_call(
                                     tool_call_id=tool_id,
                                     title=title,
                                     kind=tool_kind,
                                     status="pending",
                                 )
-                        elif tool_name == "write_file" and isinstance(tool_args, dict):
-                            path = tool_args.get("file_path")
-                            title = f"Write `{path}`" if path else tool_name
-                            update = start_tool_call(
-                                tool_call_id=tool_id,
-                                title=title,
-                                kind=tool_kind,
-                                status="pending",
-                            )
-                        else:
-                            title = tool_name
-                            update = start_tool_call(
-                                tool_call_id=tool_id,
-                                title=title,
-                                kind=tool_kind,
-                                status="pending",
-                            )
+                            elif tool_name == "edit_file" and isinstance(
+                                tool_args, dict
+                            ):
+                                path = tool_args.get("file_path", "")
+                                old_string = tool_args.get("old_string", "")
+                                new_string = tool_args.get("new_string", "")
+                                title = f"Edit `{path}`" if path else tool_name
 
-                        await self._conn.session_update(
-                            session_id=session_id, update=update, source="DeepAgent"
-                        )
-                    except json.JSONDecodeError:
-                        pass
+                                # Only create diff if we have both old and new strings
+                                if path and old_string and new_string:
+                                    diff_content = tool_diff_content(
+                                        path=path,
+                                        new_text=new_string,
+                                        old_text=old_string,
+                                    )
+                                    update = start_edit_tool_call(
+                                        tool_call_id=tool_id,
+                                        title=title,
+                                        path=path,
+                                        content=diff_content,
+                                        # This is silly but for some reason content isn't passed through
+                                        extra_options=[diff_content],
+                                    )
+                                else:
+                                    # Fallback to generic tool call if data incomplete
+                                    update = start_tool_call(
+                                        tool_call_id=tool_id,
+                                        title=title,
+                                        kind=tool_kind,
+                                        status="pending",
+                                    )
+                            elif tool_name == "write_file" and isinstance(
+                                tool_args, dict
+                            ):
+                                path = tool_args.get("file_path")
+                                title = f"Write `{path}`" if path else tool_name
+                                update = start_tool_call(
+                                    tool_call_id=tool_id,
+                                    title=title,
+                                    kind=tool_kind,
+                                    status="pending",
+                                )
+                            else:
+                                title = tool_name
+                                update = start_tool_call(
+                                    tool_call_id=tool_id,
+                                    title=title,
+                                    kind=tool_kind,
+                                    status="pending",
+                                )
+
+                            await self._conn.session_update(
+                                session_id=session_id, update=update, source="DeepAgent"
+                            )
+                        except json.JSONDecodeError:
+                            pass
 
             # Check for tool results (ToolMessage responses)
             if hasattr(message_chunk, "type") and message_chunk.type == "tool":
@@ -337,13 +410,27 @@ class ACPDeepAgent(ACPAgent):
 
 async def main(root_dir: str) -> None:
     checkpointer = MemorySaver()
-    deepagent = create_deep_agent(
-        # tools=[...],
-        # interrupt_on={...},
+
+    # Start with default mode (ask before edits)
+    mode_id = "default"
+
+    # Configure interrupt based on mode
+    mode_to_interrupt = {
+        "default": {
+            "edit_file": {"allowed_decisions": ["approve", "edit", "reject"]},
+            "write_file": {"allowed_decisions": ["approve", "edit", "reject"]},
+        },
+        "auto": None,  # No interrupts, full auto
+    }
+
+    interrupt_config = mode_to_interrupt.get(mode_id)
+
+    acp_agent = ACPDeepAgent(
+        root_dir=root_dir,
+        mode=mode_id,
         checkpointer=checkpointer,
-        backend=FilesystemBackend(root_dir=root_dir, virtual_mode=True),
+        interrupt_config=interrupt_config,
     )
-    acp_agent = ACPDeepAgent(deepagent=deepagent, root_dir=root_dir)
     await run_agent(acp_agent)
 
 
