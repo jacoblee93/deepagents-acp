@@ -234,7 +234,7 @@ class ACPDeepAgent(ACPAgent):
                         # Determine title based on tool type and args
                         if tool_name == "read_file" and isinstance(tool_args, dict):
                             path = tool_args.get("file_path")
-                            title = f"Read {path}" if path else tool_name
+                            title = f"Read `{path}`" if path else tool_name
                             update = start_tool_call(
                                 tool_call_id=tool_id,
                                 title=title,
@@ -245,7 +245,7 @@ class ACPDeepAgent(ACPAgent):
                             path = tool_args.get("file_path", "")
                             old_string = tool_args.get("old_string", "")
                             new_string = tool_args.get("new_string", "")
-                            title = f"Edit {path}" if path else tool_name
+                            title = f"Edit `{path}`" if path else tool_name
 
                             # Only create diff if we have both old and new strings
                             if path and old_string and new_string:
@@ -272,7 +272,7 @@ class ACPDeepAgent(ACPAgent):
                                 )
                         elif tool_name == "write_file" and isinstance(tool_args, dict):
                             path = tool_args.get("file_path")
-                            title = f"Write {path}" if path else tool_name
+                            title = f"Write `{path}`" if path else tool_name
                             update = start_tool_call(
                                 tool_call_id=tool_id,
                                 title=title,
