@@ -43,7 +43,7 @@ from deepagents.backends import FilesystemBackend
 from deepagents.graph import CompiledStateGraph
 
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.types import Command
+from langgraph.types import Command, StateSnapshot
 from langchain_core.runnables import RunnableConfig
 
 from deepagents_acp.utils import (
@@ -158,7 +158,7 @@ class ACPDeepAgent(ACPAgent):
 
         return SetSessionModeResponse()
 
-    async def _log(self, session_id: str, text: str):
+    async def _log_text(self, session_id: str, text: str):
         update = update_agent_message(text_block(text))
         await self._conn.session_update(
             session_id=session_id, update=update, source="DeepAgent"
@@ -337,10 +337,7 @@ class ACPDeepAgent(ACPAgent):
                                 pass
 
                 if isinstance(message_chunk, str):
-                    update = update_agent_message(text_block(message_chunk))
-                    await self._conn.session_update(
-                        session_id=session_id, update=update, source="DeepAgent"
-                    )
+                    await self._log_text(text=message_chunk, session_id=session_id)
                 # Check for tool results (ToolMessage responses)
                 elif hasattr(message_chunk, "type") and message_chunk.type == "tool":
                     # This is a tool result message
@@ -374,75 +371,80 @@ class ACPDeepAgent(ACPAgent):
                         text = str(message_chunk.content)
 
                     if text:
-                        update = update_agent_message(text_block(text))
-                        await self._conn.session_update(
-                            session_id=session_id, update=update, source="DeepAgent"
-                        )
+                        await self._log_text(text=text, session_id=session_id)
 
             # Check if the agent is interrupted (waiting for HITL approval)
             current_state = await self._deepagent.aget_state(config)
-            user_decisions = []
-            if current_state.next and current_state.interrupts:
-                # Agent is interrupted, request permission from user
-                for interrupt in current_state.interrupts:
-                    # Get the tool call info from the interrupt
-                    tool_call_id = interrupt.id
-                    interrupt_value = interrupt.value
-
-                    # Extract tool information from interrupt value
-                    tool_name = (
-                        interrupt_value.get("name", "tool")
-                        if isinstance(interrupt_value, dict)
-                        else "tool"
-                    )
-                    tool_args = (
-                        interrupt_value.get("args", {})
-                        if isinstance(interrupt_value, dict)
-                        else {}
-                    )
-
-                    # Create a title for the permission request
-                    if tool_name == "edit_file" and isinstance(tool_args, dict):
-                        file_path = tool_args.get("file_path", "file")
-                        title = f"Edit `{file_path}`"
-                    elif tool_name == "write_file" and isinstance(tool_args, dict):
-                        file_path = tool_args.get("file_path", "file")
-                        title = f"Write `{file_path}`"
-                    else:
-                        title = tool_name
-
-                    # Create permission options
-                    options = [
-                        PermissionOption(
-                            option_id="approve",
-                            name="Approve",
-                            kind="allow_once",
-                        ),
-                        PermissionOption(
-                            option_id="reject",
-                            name="Reject",
-                            kind="reject_once",
-                        ),
-                    ]
-
-                    # Request permission from the client
-                    tool_call_update = ToolCallUpdate(
-                        tool_call_id=tool_call_id,
-                        title=title,
-                    )
-                    response = await self._conn.request_permission(
-                        session_id=session_id,
-                        tool_call=tool_call_update,
-                        options=options,
-                    )
-                    # Handle the user's decision
-                    if response.outcome.outcome == "selected":
-                        user_decisions.append({"type": response.outcome.option_id})
-                    else:
-                        # User cancelled, treat as rejection
-                        user_decisions.append({"type": "reject"})
+            user_decisions = await self._handle_interrupts(
+                current_state=current_state, session_id=session_id
+            )
 
         return PromptResponse(stop_reason="end_turn")
+
+    async def _handle_interrupts(
+        self, *, current_state: StateSnapshot, session_id: str
+    ):
+        user_decisions = []
+        if current_state.next and current_state.interrupts:
+            # Agent is interrupted, request permission from user
+            for interrupt in current_state.interrupts:
+                # Get the tool call info from the interrupt
+                tool_call_id = interrupt.id
+                interrupt_value = interrupt.value
+
+                # Extract tool information from interrupt value
+                tool_name = (
+                    interrupt_value.get("name", "tool")
+                    if isinstance(interrupt_value, dict)
+                    else "tool"
+                )
+                tool_args = (
+                    interrupt_value.get("args", {})
+                    if isinstance(interrupt_value, dict)
+                    else {}
+                )
+
+                # Create a title for the permission request
+                if tool_name == "edit_file" and isinstance(tool_args, dict):
+                    file_path = tool_args.get("file_path", "file")
+                    title = f"Edit `{file_path}`"
+                elif tool_name == "write_file" and isinstance(tool_args, dict):
+                    file_path = tool_args.get("file_path", "file")
+                    title = f"Write `{file_path}`"
+                else:
+                    title = tool_name
+
+                # Create permission options
+                options = [
+                    PermissionOption(
+                        option_id="approve",
+                        name="Approve",
+                        kind="allow_once",
+                    ),
+                    PermissionOption(
+                        option_id="reject",
+                        name="Reject",
+                        kind="reject_once",
+                    ),
+                ]
+
+                # Request permission from the client
+                tool_call_update = ToolCallUpdate(
+                    tool_call_id=tool_call_id,
+                    title=title,
+                )
+                response = await self._conn.request_permission(
+                    session_id=session_id,
+                    tool_call=tool_call_update,
+                    options=options,
+                )
+                # Handle the user's decision
+                if response.outcome.outcome == "selected":
+                    user_decisions.append({"type": response.outcome.option_id})
+                else:
+                    # User cancelled, treat as rejection
+                    user_decisions.append({"type": "reject"})
+            return user_decisions
 
 
 async def run_agent(root_dir: str) -> None:
