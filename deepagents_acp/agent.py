@@ -182,11 +182,7 @@ class ACPDeepAgent(ACPAgent):
             if isinstance(block, TextContentBlock):
                 content_blocks.extend(convert_text_block_to_content_blocks(block))
             elif isinstance(block, ImageContentBlock):
-                content_blocks.extend(
-                    convert_image_block_to_content_blocks(
-                        block, root_dir=self._root_dir
-                    )
-                )
+                content_blocks.extend(convert_image_block_to_content_blocks(block))
             elif isinstance(block, AudioContentBlock):
                 content_blocks.extend(convert_audio_block_to_content_blocks(block))
             elif isinstance(block, ResourceContentBlock):

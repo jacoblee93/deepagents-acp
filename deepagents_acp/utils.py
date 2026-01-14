@@ -11,34 +11,15 @@ def convert_text_block_to_content_blocks(block: TextContentBlock):
     return [{"type": "text", "text": block.text}]
 
 
-def convert_image_block_to_content_blocks(block: ImageContentBlock, *, root_dir: str):
+def convert_image_block_to_content_blocks(block: ImageContentBlock):
     # Image blocks contain visual data
-    # URIs are local file paths, provide as text so agent can read with tools
-    if block.uri:
-        # Truncate root_dir from path while preserving file:// prefix
-        uri = block.uri
-        has_file_prefix = uri.startswith("file://")
-        if has_file_prefix:
-            path = uri[7:]  # Remove "file://" temporarily
-        else:
-            path = uri
-
-        # Remove root_dir prefix to get path relative to agent's working directory
-        if path.startswith(root_dir):
-            path = path[len(root_dir) :].lstrip("/")
-
-        # Restore file:// prefix if it was present
-        uri = f"file://{path}" if has_file_prefix else path
-        return [
-            {
-                "type": "text",
-                "text": f"[Image file at path: {uri}, MIME type: {block.mime_type}]",
-            }
-        ]
-    else:
-        # Use inline base64 data
+    # Primary case: inline base64 data (data is already a base64 string)
+    if block.data:
         data_uri = f"data:{block.mime_type};base64,{block.data}"
-        return [{"type": "image_url", "image_url": data_uri}]
+        return [{"type": "image_url", "image_url": {"url": data_uri}}]
+
+    # No data available
+    return [{"type": "text", "text": "[Image: no data available]"}]
 
 
 def convert_audio_block_to_content_blocks(block: AudioContentBlock):
