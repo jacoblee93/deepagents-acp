@@ -1,5 +1,3 @@
-import argparse
-import asyncio
 import json
 from typing import Any
 from uuid import uuid4
@@ -12,7 +10,7 @@ from acp import (
     NewSessionResponse,
     PromptResponse,
     SetSessionModeResponse,
-    run_agent,
+    run_agent as run_acp_agent,
     text_block,
     update_agent_message,
     start_tool_call,
@@ -23,6 +21,7 @@ from acp import (
 )
 from acp.interfaces import Client
 from acp.schema import (
+    AgentCapabilities,
     AudioContentBlock,
     ClientCapabilities,
     EmbeddedResourceContentBlock,
@@ -31,6 +30,7 @@ from acp.schema import (
     Implementation,
     McpServerStdio,
     PermissionOption,
+    PromptCapabilities,
     ResourceContentBlock,
     SessionMode,
     SessionModeState,
@@ -44,7 +44,15 @@ from deepagents.graph import CompiledStateGraph
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
-from langchain_core.runnables import Runnable, RunnableConfig
+from langchain_core.runnables import RunnableConfig
+
+from deepagents_acp.utils import (
+    convert_audio_block_to_content_blocks,
+    convert_embedded_resource_block_to_content_blocks,
+    convert_resource_block_to_content_blocks,
+    convert_text_block_to_content_blocks,
+    convert_image_block_to_content_blocks,
+)
 
 load_dotenv()
 
@@ -84,7 +92,15 @@ class ACPDeepAgent(ACPAgent):
         client_info: Implementation | None = None,
         **kwargs: Any,
     ) -> InitializeResponse:
-        return InitializeResponse(protocol_version=protocol_version)
+        return InitializeResponse(
+            protocol_version=protocol_version,
+            agent_capabilities=AgentCapabilities(
+                prompt_capabilities=PromptCapabilities(
+                    image=True,
+                    # embedded_context=True,
+                )
+            ),
+        )
 
     async def new_session(
         self,
@@ -164,85 +180,25 @@ class ACPDeepAgent(ACPAgent):
         content_blocks = []
         for block in prompt:
             if isinstance(block, TextContentBlock):
-                content_blocks.append({"type": "text", "text": block.text})
+                content_blocks.extend(convert_text_block_to_content_blocks(block))
             elif isinstance(block, ImageContentBlock):
-                # Image blocks contain visual data
-                # URIs are local file paths, provide as text so agent can read with tools
-                if block.uri:
-                    # Truncate root_dir from path while preserving file:// prefix
-                    uri = block.uri
-                    has_file_prefix = uri.startswith("file://")
-                    if has_file_prefix:
-                        path = uri[7:]  # Remove "file://" temporarily
-                    else:
-                        path = uri
-
-                    # Remove root_dir prefix to get path relative to agent's working directory
-                    if path.startswith(self._root_dir):
-                        path = path[len(self._root_dir) :].lstrip("/")
-
-                    # Restore file:// prefix if it was present
-                    uri = f"file://{path}" if has_file_prefix else path
-                    content_blocks.append(
-                        {
-                            "type": "text",
-                            "text": f"[Image file at path: {uri}, MIME type: {block.mime_type}]",
-                        }
+                content_blocks.extend(
+                    convert_image_block_to_content_blocks(
+                        block, root_dir=self._root_dir
                     )
-                else:
-                    # Use inline base64 data
-                    data_uri = f"data:{block.mime_type};base64,{block.data}"
-                    content_blocks.append({"type": "image_url", "image_url": data_uri})
-            elif isinstance(block, AudioContentBlock):
-                # Audio blocks - represent as text with data URI for tools to access
-                data_uri = f"data:{block.mime_type};base64,{block.data}"
-                content_blocks.append(
-                    {"type": "text", "text": f"[Audio file available at: {data_uri}]"}
                 )
+            elif isinstance(block, AudioContentBlock):
+                content_blocks.extend(convert_audio_block_to_content_blocks(block))
             elif isinstance(block, ResourceContentBlock):
-                # Resource blocks reference external resources
-                resource_text = f"[Resource: {block.name}"
-                if block.uri:
-                    # Truncate root_dir from path while preserving file:// prefix
-                    uri = block.uri
-                    has_file_prefix = uri.startswith("file://")
-                    if has_file_prefix:
-                        path = uri[7:]  # Remove "file://" temporarily
-                    else:
-                        path = uri
-
-                    # Remove root_dir prefix to get path relative to agent's working directory
-                    if path.startswith(self._root_dir):
-                        path = path[len(self._root_dir) :].lstrip("/")
-
-                    # Restore file:// prefix if it was present
-                    uri = f"file://{path}" if has_file_prefix else path
-                    resource_text += f"\nURI: {uri}"
-                if block.description:
-                    resource_text += f"\nDescription: {block.description}"
-                if block.mime_type:
-                    resource_text += f"\nMIME type: {block.mime_type}"
-                resource_text += "]"
-                content_blocks.append({"type": "text", "text": resource_text})
+                content_blocks.extend(
+                    convert_resource_block_to_content_blocks(
+                        block, root_dir=self._root_dir
+                    )
+                )
             elif isinstance(block, EmbeddedResourceContentBlock):
-                # Embedded resource blocks contain the resource data inline
-                resource = block.resource
-                if hasattr(resource, "text"):
-                    # Text resource
-                    content_blocks.append({"type": "text", "text": resource.text})
-                elif hasattr(resource, "blob"):
-                    # Binary resource - provide as data URI
-                    mime_type = getattr(
-                        resource, "mime_type", "application/octet-stream"
-                    )
-                    data_uri = f"data:{mime_type};base64,{resource.blob}"
-                    content_blocks.append(
-                        {
-                            "type": "text",
-                            "text": f"[Embedded resource available at: {data_uri}]",
-                        }
-                    )
-
+                content_blocks.extend(
+                    convert_embedded_resource_block_to_content_blocks(block)
+                )
         # Stream the deep agent response with multimodal content
         config: RunnableConfig = {"configurable": {"thread_id": session_id}}
 
@@ -493,7 +449,7 @@ class ACPDeepAgent(ACPAgent):
         return PromptResponse(stop_reason="end_turn")
 
 
-async def main(root_dir: str) -> None:
+async def run_agent(root_dir: str) -> None:
     checkpointer = MemorySaver()
 
     # Start with ask_before_edits mode (ask before edits)
@@ -516,18 +472,4 @@ async def main(root_dir: str) -> None:
         checkpointer=checkpointer,
         interrupt_config=interrupt_config,
     )
-    await run_agent(acp_agent)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Run ACP DeepAgent with specified root directory"
-    )
-    parser.add_argument(
-        "--root-dir",
-        type=str,
-        default="/",
-        help="Root directory accessible to the agent (default: /)",
-    )
-    args = parser.parse_args()
-    asyncio.run(main(args.root_dir))
+    await run_acp_agent(acp_agent)
