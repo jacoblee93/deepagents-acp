@@ -1,5 +1,4 @@
 import argparse
-import ast
 import asyncio
 import json
 from typing import Any
@@ -41,8 +40,10 @@ from acp.schema import (
 )
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
+from deepagents.graph import CompiledStateGraph
 
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
 from langchain_core.runnables import Runnable, RunnableConfig
 
 load_dotenv()
@@ -51,7 +52,7 @@ load_dotenv()
 class ACPDeepAgent(ACPAgent):
     _conn: Client
 
-    _deepagent: Runnable
+    _deepagent: CompiledStateGraph
     _root_dir: str
     _checkpointer: Checkpointer
     _mode: str
@@ -94,8 +95,8 @@ class ACPDeepAgent(ACPAgent):
         # Define available modes
         available_modes = [
             SessionMode(
-                id="default",
-                name="Default",
+                id="ask_before_edits",
+                name="Ask before edits",
                 description="Ask permission before edits and writes",
             ),
             SessionMode(
@@ -109,7 +110,7 @@ class ACPDeepAgent(ACPAgent):
             session_id=uuid4().hex,
             modes=SessionModeState(
                 available_modes=available_modes,
-                current_mode_id="default",
+                current_mode_id="ask_before_edits",
             ),
         )
 
@@ -121,9 +122,9 @@ class ACPDeepAgent(ACPAgent):
     ) -> SetSessionModeResponse:
         # Map mode IDs to interrupt configurations
         mode_to_interrupt = {
-            "default": {
-                "edit_file": {"allowed_decisions": ["approve", "edit", "reject"]},
-                "write_file": {"allowed_decisions": ["approve", "edit", "reject"]},
+            "ask_before_edits": {
+                "edit_file": {"allowed_decisions": ["approve", "reject"]},
+                "write_file": {"allowed_decisions": ["approve", "reject"]},
             },
             "auto": None,  # No interrupts, full auto
         }
@@ -140,6 +141,12 @@ class ACPDeepAgent(ACPAgent):
         self._current_mode = mode_id
 
         return SetSessionModeResponse()
+
+    async def _log(self, session_id: str, text: str):
+        update = update_agent_message(text_block(text))
+        await self._conn.session_update(
+            session_id=session_id, update=update, source="DeepAgent"
+        )
 
     async def prompt(
         self,
@@ -243,167 +250,245 @@ class ACPDeepAgent(ACPAgent):
         active_tool_calls = {}
         tool_call_accumulator = {}  # index -> {id, name, args_str}
 
-        # Stream messages which include LLM output and tool calls
-        async for message_chunk, metadata in self._deepagent.astream(
-            {"messages": [{"role": "user", "content": content_blocks}]},
-            config=config,
-            stream_mode="messages",
-        ):
-            # Check for tool call chunks (streaming pieces of tool calls)
-            if (
-                hasattr(message_chunk, "tool_call_chunks")
-                and message_chunk.tool_call_chunks
+        current_state = None
+        user_decisions = []
+
+        while current_state is None or current_state.interrupts:
+            async for message_chunk, metadata in self._deepagent.astream(
+                Command(resume={"decisions": user_decisions})
+                if user_decisions
+                else {"messages": [{"role": "user", "content": content_blocks}]},
+                config=config,
+                stream_mode="messages",
             ):
-                for chunk in message_chunk.tool_call_chunks:
-                    chunk_id = chunk.get("id")
-                    chunk_name = chunk.get("name")
-                    chunk_args = chunk.get("args", "")
-                    chunk_index = chunk.get("index", 0)
+                # Check for tool call chunks (streaming pieces of tool calls)
+                if (
+                    not isinstance(message_chunk, str)
+                    and hasattr(message_chunk, "tool_call_chunks")
+                    and message_chunk.tool_call_chunks
+                ):
+                    for chunk in message_chunk.tool_call_chunks:
+                        chunk_id = chunk.get("id")
+                        chunk_name = chunk.get("name")
+                        chunk_args = chunk.get("args", "")
+                        chunk_index = chunk.get("index", 0)
 
-                    # Initialize accumulator for this index if we have id and name
-                    if chunk_id and chunk_name:
-                        if (
-                            chunk_index not in tool_call_accumulator
-                            or chunk_id != tool_call_accumulator[chunk_index]
-                        ):
-                            tool_call_accumulator[chunk_index] = {
-                                "id": chunk_id,
-                                "name": chunk_name,
-                                "args_str": "",
-                            }
-
-                    # Accumulate args string chunks using index
-                    if chunk_args and chunk_index in tool_call_accumulator:
-                        tool_call_accumulator[chunk_index]["args_str"] += chunk_args
-
-                # After processing chunks, try to start any tool calls with complete args
-                for index, acc in tool_call_accumulator.items():
-                    tool_id = acc.get("id")
-                    tool_name = acc.get("name")
-                    args_str = acc.get("args_str", "")
-
-                    # Only start if we haven't started yet and have parseable args
-                    if tool_id and tool_id not in active_tool_calls and args_str:
-                        try:
-                            tool_args = json.loads(args_str)
-
-                            # Mark as started
-                            active_tool_calls[tool_id] = {"name": tool_name}
-
-                            kind_map: dict = {
-                                "read_file": "read",
-                                "edit_file": "edit",
-                                "write_file": "edit",
-                                "ls": "search",
-                                "glob": "search",
-                                "grep": "search",
-                            }
-                            tool_kind = kind_map.get(tool_name, "other")
-
-                            # Determine title based on tool type and args
-                            if tool_name == "read_file" and isinstance(tool_args, dict):
-                                path = tool_args.get("file_path")
-                                title = f"Read `{path}`" if path else tool_name
-                                update = start_tool_call(
-                                    tool_call_id=tool_id,
-                                    title=title,
-                                    kind=tool_kind,
-                                    status="pending",
-                                )
-                            elif tool_name == "edit_file" and isinstance(
-                                tool_args, dict
+                        # Initialize accumulator for this index if we have id and name
+                        if chunk_id and chunk_name:
+                            if (
+                                chunk_index not in tool_call_accumulator
+                                or chunk_id != tool_call_accumulator[chunk_index]
                             ):
-                                path = tool_args.get("file_path", "")
-                                old_string = tool_args.get("old_string", "")
-                                new_string = tool_args.get("new_string", "")
-                                title = f"Edit `{path}`" if path else tool_name
+                                tool_call_accumulator[chunk_index] = {
+                                    "id": chunk_id,
+                                    "name": chunk_name,
+                                    "args_str": "",
+                                }
 
-                                # Only create diff if we have both old and new strings
-                                if path and old_string and new_string:
-                                    diff_content = tool_diff_content(
-                                        path=path,
-                                        new_text=new_string,
-                                        old_text=old_string,
-                                    )
-                                    update = start_edit_tool_call(
-                                        tool_call_id=tool_id,
-                                        title=title,
-                                        path=path,
-                                        content=diff_content,
-                                        # This is silly but for some reason content isn't passed through
-                                        extra_options=[diff_content],
-                                    )
-                                else:
-                                    # Fallback to generic tool call if data incomplete
+                        # Accumulate args string chunks using index
+                        if chunk_args and chunk_index in tool_call_accumulator:
+                            tool_call_accumulator[chunk_index]["args_str"] += chunk_args
+
+                    # After processing chunks, try to start any tool calls with complete args
+                    for index, acc in tool_call_accumulator.items():
+                        tool_id = acc.get("id")
+                        tool_name = acc.get("name")
+                        args_str = acc.get("args_str", "")
+
+                        # Only start if we haven't started yet and have parseable args
+                        if tool_id and tool_id not in active_tool_calls and args_str:
+                            try:
+                                tool_args = json.loads(args_str)
+
+                                # Mark as started
+                                active_tool_calls[tool_id] = {"name": tool_name}
+
+                                kind_map: dict = {
+                                    "read_file": "read",
+                                    "edit_file": "edit",
+                                    "write_file": "edit",
+                                    "ls": "search",
+                                    "glob": "search",
+                                    "grep": "search",
+                                }
+                                tool_kind = kind_map.get(tool_name, "other")
+
+                                # Determine title based on tool type and args
+                                if tool_name == "read_file" and isinstance(
+                                    tool_args, dict
+                                ):
+                                    path = tool_args.get("file_path")
+                                    title = f"Read `{path}`" if path else tool_name
                                     update = start_tool_call(
                                         tool_call_id=tool_id,
                                         title=title,
                                         kind=tool_kind,
                                         status="pending",
                                     )
-                            elif tool_name == "write_file" and isinstance(
-                                tool_args, dict
-                            ):
-                                path = tool_args.get("file_path")
-                                title = f"Write `{path}`" if path else tool_name
-                                update = start_tool_call(
-                                    tool_call_id=tool_id,
-                                    title=title,
-                                    kind=tool_kind,
-                                    status="pending",
-                                )
-                            else:
-                                title = tool_name
-                                update = start_tool_call(
-                                    tool_call_id=tool_id,
-                                    title=title,
-                                    kind=tool_kind,
-                                    status="pending",
-                                )
+                                elif tool_name == "edit_file" and isinstance(
+                                    tool_args, dict
+                                ):
+                                    path = tool_args.get("file_path", "")
+                                    old_string = tool_args.get("old_string", "")
+                                    new_string = tool_args.get("new_string", "")
+                                    title = f"Edit `{path}`" if path else tool_name
 
+                                    # Only create diff if we have both old and new strings
+                                    if path and old_string and new_string:
+                                        diff_content = tool_diff_content(
+                                            path=path,
+                                            new_text=new_string,
+                                            old_text=old_string,
+                                        )
+                                        update = start_edit_tool_call(
+                                            tool_call_id=tool_id,
+                                            title=title,
+                                            path=path,
+                                            content=diff_content,
+                                            # This is silly but for some reason content isn't passed through
+                                            extra_options=[diff_content],
+                                        )
+                                    else:
+                                        # Fallback to generic tool call if data incomplete
+                                        update = start_tool_call(
+                                            tool_call_id=tool_id,
+                                            title=title,
+                                            kind=tool_kind,
+                                            status="pending",
+                                        )
+                                elif tool_name == "write_file" and isinstance(
+                                    tool_args, dict
+                                ):
+                                    path = tool_args.get("file_path")
+                                    title = f"Write `{path}`" if path else tool_name
+                                    update = start_tool_call(
+                                        tool_call_id=tool_id,
+                                        title=title,
+                                        kind=tool_kind,
+                                        status="pending",
+                                    )
+                                else:
+                                    title = tool_name
+                                    update = start_tool_call(
+                                        tool_call_id=tool_id,
+                                        title=title,
+                                        kind=tool_kind,
+                                        status="pending",
+                                    )
+
+                                await self._conn.session_update(
+                                    session_id=session_id,
+                                    update=update,
+                                    source="DeepAgent",
+                                )
+                            except json.JSONDecodeError:
+                                pass
+
+                if isinstance(message_chunk, str):
+                    update = update_agent_message(text_block(message_chunk))
+                    await self._conn.session_update(
+                        session_id=session_id, update=update, source="DeepAgent"
+                    )
+                # Check for tool results (ToolMessage responses)
+                elif hasattr(message_chunk, "type") and message_chunk.type == "tool":
+                    # This is a tool result message
+                    tool_call_id = getattr(message_chunk, "tool_call_id", None)
+                    if tool_call_id and tool_call_id in active_tool_calls:
+                        if active_tool_calls[tool_call_id].get("name") != "edit_file":
+                            # Update the tool call with completion status and result
+                            content = getattr(message_chunk, "content", "")
+                            update = update_tool_call(
+                                tool_call_id=tool_call_id,
+                                status="completed",
+                                content=[tool_content(text_block(str(content)))],
+                            )
                             await self._conn.session_update(
                                 session_id=session_id, update=update, source="DeepAgent"
                             )
-                        except json.JSONDecodeError:
-                            pass
 
-            # Check for tool results (ToolMessage responses)
-            if hasattr(message_chunk, "type") and message_chunk.type == "tool":
-                # This is a tool result message
-                tool_call_id = getattr(message_chunk, "tool_call_id", None)
-                if tool_call_id and tool_call_id in active_tool_calls:
-                    if active_tool_calls[tool_call_id].get("name") != "edit_file":
-                        # Update the tool call with completion status and result
-                        content = getattr(message_chunk, "content", "")
-                        update = update_tool_call(
-                            tool_call_id=tool_call_id,
-                            status="completed",
-                            content=[tool_content(text_block(str(content)))],
-                        )
+                elif message_chunk.content:
+                    # content can be a string or a list of content blocks
+                    if isinstance(message_chunk.content, str):
+                        text = message_chunk.content
+                    elif isinstance(message_chunk.content, list):
+                        # Extract text from content blocks
+                        text = ""
+                        for block in message_chunk.content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                text += block.get("text", "")
+                            elif isinstance(block, str):
+                                text += block
+                    else:
+                        text = str(message_chunk.content)
+
+                    if text:
+                        update = update_agent_message(text_block(text))
                         await self._conn.session_update(
                             session_id=session_id, update=update, source="DeepAgent"
                         )
 
-            elif message_chunk.content:
-                # content can be a string or a list of content blocks
-                if isinstance(message_chunk.content, str):
-                    text = message_chunk.content
-                elif isinstance(message_chunk.content, list):
-                    # Extract text from content blocks
-                    text = ""
-                    for block in message_chunk.content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text += block.get("text", "")
-                        elif isinstance(block, str):
-                            text += block
-                else:
-                    text = str(message_chunk.content)
+            # Check if the agent is interrupted (waiting for HITL approval)
+            current_state = await self._deepagent.aget_state(config)
+            user_decisions = []
+            if current_state.next and current_state.interrupts:
+                # Agent is interrupted, request permission from user
+                for interrupt in current_state.interrupts:
+                    # Get the tool call info from the interrupt
+                    tool_call_id = interrupt.id
+                    interrupt_value = interrupt.value
 
-                if text:
-                    update = update_agent_message(text_block(text))
-                    await self._conn.session_update(
-                        session_id=session_id, update=update, source="DeepAgent"
+                    # Extract tool information from interrupt value
+                    tool_name = (
+                        interrupt_value.get("name", "tool")
+                        if isinstance(interrupt_value, dict)
+                        else "tool"
                     )
+                    tool_args = (
+                        interrupt_value.get("args", {})
+                        if isinstance(interrupt_value, dict)
+                        else {}
+                    )
+
+                    # Create a title for the permission request
+                    if tool_name == "edit_file" and isinstance(tool_args, dict):
+                        file_path = tool_args.get("file_path", "file")
+                        title = f"Edit `{file_path}`"
+                    elif tool_name == "write_file" and isinstance(tool_args, dict):
+                        file_path = tool_args.get("file_path", "file")
+                        title = f"Write `{file_path}`"
+                    else:
+                        title = tool_name
+
+                    # Create permission options
+                    options = [
+                        PermissionOption(
+                            option_id="approve",
+                            name="Approve",
+                            kind="allow_once",
+                        ),
+                        PermissionOption(
+                            option_id="reject",
+                            name="Reject",
+                            kind="reject_once",
+                        ),
+                    ]
+
+                    # Request permission from the client
+                    tool_call_update = ToolCallUpdate(
+                        tool_call_id=tool_call_id,
+                        title=title,
+                    )
+                    response = await self._conn.request_permission(
+                        session_id=session_id,
+                        tool_call=tool_call_update,
+                        options=options,
+                    )
+                    # Handle the user's decision
+                    if response.outcome.outcome == "selected":
+                        user_decisions.append({"type": response.outcome.option_id})
+                    else:
+                        # User cancelled, treat as rejection
+                        user_decisions.append({"type": "reject"})
 
         return PromptResponse(stop_reason="end_turn")
 
@@ -411,14 +496,14 @@ class ACPDeepAgent(ACPAgent):
 async def main(root_dir: str) -> None:
     checkpointer = MemorySaver()
 
-    # Start with default mode (ask before edits)
-    mode_id = "default"
+    # Start with ask_before_edits mode (ask before edits)
+    mode_id = "ask_before_edits"
 
     # Configure interrupt based on mode
     mode_to_interrupt = {
-        "default": {
-            "edit_file": {"allowed_decisions": ["approve", "edit", "reject"]},
-            "write_file": {"allowed_decisions": ["approve", "edit", "reject"]},
+        "ask_before_edits": {
+            "edit_file": {"allowed_decisions": ["approve", "reject"]},
+            "write_file": {"allowed_decisions": ["approve", "reject"]},
         },
         "auto": None,  # No interrupts, full auto
     }
