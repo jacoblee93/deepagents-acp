@@ -36,6 +36,7 @@ from acp.schema import (
     SessionModeState,
     SseMcpServer,
     TextContentBlock,
+    ToolCallStart,
     ToolCallUpdate,
 )
 from deepagents import create_deep_agent
@@ -164,6 +165,139 @@ class ACPDeepAgent(ACPAgent):
             session_id=session_id, update=update, source="DeepAgent"
         )
 
+    async def _process_tool_call_chunks(
+        self,
+        session_id: str,
+        message_chunk: Any,
+        active_tool_calls: dict,
+        tool_call_accumulator: dict,
+    ) -> None:
+        """Process tool call chunks and start tool calls when complete."""
+        if (
+            not isinstance(message_chunk, str)
+            and hasattr(message_chunk, "tool_call_chunks")
+            and message_chunk.tool_call_chunks
+        ):
+            for chunk in message_chunk.tool_call_chunks:
+                chunk_id = chunk.get("id")
+                chunk_name = chunk.get("name")
+                chunk_args = chunk.get("args", "")
+                chunk_index = chunk.get("index", 0)
+
+                # Initialize accumulator for this index if we have id and name
+                if chunk_id and chunk_name:
+                    if (
+                        chunk_index not in tool_call_accumulator
+                        or chunk_id != tool_call_accumulator[chunk_index]
+                    ):
+                        tool_call_accumulator[chunk_index] = {
+                            "id": chunk_id,
+                            "name": chunk_name,
+                            "args_str": "",
+                        }
+
+                # Accumulate args string chunks using index
+                if chunk_args and chunk_index in tool_call_accumulator:
+                    tool_call_accumulator[chunk_index]["args_str"] += chunk_args
+
+            # After processing chunks, try to start any tool calls with complete args
+            for index, acc in tool_call_accumulator.items():
+                tool_id = acc.get("id")
+                tool_name = acc.get("name")
+                args_str = acc.get("args_str", "")
+
+                # Only start if we haven't started yet and have parseable args
+                if tool_id and tool_id not in active_tool_calls and args_str:
+                    try:
+                        tool_args = json.loads(args_str)
+
+                        # Mark as started
+                        active_tool_calls[tool_id] = {"name": tool_name}
+
+                        # Create the appropriate tool call update
+                        update = self._create_tool_call_update(
+                            tool_id, tool_name, tool_args
+                        )
+
+                        await self._conn.session_update(
+                            session_id=session_id,
+                            update=update,
+                            source="DeepAgent",
+                        )
+                    except json.JSONDecodeError:
+                        pass
+
+    def _create_tool_call_update(
+        self, tool_id: str, tool_name: str, tool_args: dict[str, Any]
+    ) -> ToolCallStart:
+        """Create a tool call update based on tool type and arguments."""
+        kind_map: dict = {
+            "read_file": "read",
+            "edit_file": "edit",
+            "write_file": "edit",
+            "ls": "search",
+            "glob": "search",
+            "grep": "search",
+        }
+        tool_kind = kind_map.get(tool_name, "other")
+
+        # Determine title and create appropriate update based on tool type
+        if tool_name == "read_file" and isinstance(tool_args, dict):
+            path = tool_args.get("file_path")
+            title = f"Read `{path}`" if path else tool_name
+            return start_tool_call(
+                tool_call_id=tool_id,
+                title=title,
+                kind=tool_kind,
+                status="pending",
+            )
+        elif tool_name == "edit_file" and isinstance(tool_args, dict):
+            path = tool_args.get("file_path", "")
+            old_string = tool_args.get("old_string", "")
+            new_string = tool_args.get("new_string", "")
+            title = f"Edit `{path}`" if path else tool_name
+
+            # Only create diff if we have both old and new strings
+            if path and old_string and new_string:
+                diff_content = tool_diff_content(
+                    path=path,
+                    new_text=new_string,
+                    old_text=old_string,
+                )
+                return start_edit_tool_call(
+                    tool_call_id=tool_id,
+                    title=title,
+                    path=path,
+                    content=diff_content,
+                    # This is silly but for some reason content isn't passed through
+                    extra_options=[diff_content],
+                )
+            else:
+                # Fallback to generic tool call if data incomplete
+                return start_tool_call(
+                    tool_call_id=tool_id,
+                    title=title,
+                    kind=tool_kind,
+                    status="pending",
+                )
+        elif tool_name == "write_file" and isinstance(tool_args, dict):
+            path = tool_args.get("file_path")
+            title = f"Write `{path}`" if path else tool_name
+            return start_tool_call(
+                tool_call_id=tool_id,
+                title=title,
+                kind=tool_kind,
+                status="pending",
+            )
+        else:
+            title = tool_name
+            return start_tool_call(
+                tool_call_id=tool_id,
+                title=title,
+                kind=tool_kind,
+                status="pending",
+            )
+
     async def prompt(
         self,
         prompt: list[
@@ -213,128 +347,13 @@ class ACPDeepAgent(ACPAgent):
                 config=config,
                 stream_mode="messages",
             ):
-                # Check for tool call chunks (streaming pieces of tool calls)
-                if (
-                    not isinstance(message_chunk, str)
-                    and hasattr(message_chunk, "tool_call_chunks")
-                    and message_chunk.tool_call_chunks
-                ):
-                    for chunk in message_chunk.tool_call_chunks:
-                        chunk_id = chunk.get("id")
-                        chunk_name = chunk.get("name")
-                        chunk_args = chunk.get("args", "")
-                        chunk_index = chunk.get("index", 0)
-
-                        # Initialize accumulator for this index if we have id and name
-                        if chunk_id and chunk_name:
-                            if (
-                                chunk_index not in tool_call_accumulator
-                                or chunk_id != tool_call_accumulator[chunk_index]
-                            ):
-                                tool_call_accumulator[chunk_index] = {
-                                    "id": chunk_id,
-                                    "name": chunk_name,
-                                    "args_str": "",
-                                }
-
-                        # Accumulate args string chunks using index
-                        if chunk_args and chunk_index in tool_call_accumulator:
-                            tool_call_accumulator[chunk_index]["args_str"] += chunk_args
-
-                    # After processing chunks, try to start any tool calls with complete args
-                    for index, acc in tool_call_accumulator.items():
-                        tool_id = acc.get("id")
-                        tool_name = acc.get("name")
-                        args_str = acc.get("args_str", "")
-
-                        # Only start if we haven't started yet and have parseable args
-                        if tool_id and tool_id not in active_tool_calls and args_str:
-                            try:
-                                tool_args = json.loads(args_str)
-
-                                # Mark as started
-                                active_tool_calls[tool_id] = {"name": tool_name}
-
-                                kind_map: dict = {
-                                    "read_file": "read",
-                                    "edit_file": "edit",
-                                    "write_file": "edit",
-                                    "ls": "search",
-                                    "glob": "search",
-                                    "grep": "search",
-                                }
-                                tool_kind = kind_map.get(tool_name, "other")
-
-                                # Determine title based on tool type and args
-                                if tool_name == "read_file" and isinstance(
-                                    tool_args, dict
-                                ):
-                                    path = tool_args.get("file_path")
-                                    title = f"Read `{path}`" if path else tool_name
-                                    update = start_tool_call(
-                                        tool_call_id=tool_id,
-                                        title=title,
-                                        kind=tool_kind,
-                                        status="pending",
-                                    )
-                                elif tool_name == "edit_file" and isinstance(
-                                    tool_args, dict
-                                ):
-                                    path = tool_args.get("file_path", "")
-                                    old_string = tool_args.get("old_string", "")
-                                    new_string = tool_args.get("new_string", "")
-                                    title = f"Edit `{path}`" if path else tool_name
-
-                                    # Only create diff if we have both old and new strings
-                                    if path and old_string and new_string:
-                                        diff_content = tool_diff_content(
-                                            path=path,
-                                            new_text=new_string,
-                                            old_text=old_string,
-                                        )
-                                        update = start_edit_tool_call(
-                                            tool_call_id=tool_id,
-                                            title=title,
-                                            path=path,
-                                            content=diff_content,
-                                            # This is silly but for some reason content isn't passed through
-                                            extra_options=[diff_content],
-                                        )
-                                    else:
-                                        # Fallback to generic tool call if data incomplete
-                                        update = start_tool_call(
-                                            tool_call_id=tool_id,
-                                            title=title,
-                                            kind=tool_kind,
-                                            status="pending",
-                                        )
-                                elif tool_name == "write_file" and isinstance(
-                                    tool_args, dict
-                                ):
-                                    path = tool_args.get("file_path")
-                                    title = f"Write `{path}`" if path else tool_name
-                                    update = start_tool_call(
-                                        tool_call_id=tool_id,
-                                        title=title,
-                                        kind=tool_kind,
-                                        status="pending",
-                                    )
-                                else:
-                                    title = tool_name
-                                    update = start_tool_call(
-                                        tool_call_id=tool_id,
-                                        title=title,
-                                        kind=tool_kind,
-                                        status="pending",
-                                    )
-
-                                await self._conn.session_update(
-                                    session_id=session_id,
-                                    update=update,
-                                    source="DeepAgent",
-                                )
-                            except json.JSONDecodeError:
-                                pass
+                # Process tool call chunks
+                await self._process_tool_call_chunks(
+                    session_id,
+                    message_chunk,
+                    active_tool_calls,
+                    tool_call_accumulator,
+                )
 
                 if isinstance(message_chunk, str):
                     await self._log_text(text=message_chunk, session_id=session_id)
