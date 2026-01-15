@@ -1,7 +1,7 @@
 [project]
 name = "deepagents-acp"
 version = "0.1.0"
-description = "Add your description here"
+description = "DeepAgents ACP server for AI coding assistants"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -9,6 +9,12 @@ dependencies = [
     "deepagents>=0.3.5",
     "python-dotenv>=1.2.1",
 ]
+
+[project.scripts]
+deepagents-acp = "deepagents_acp.__main__:main"
+
+[tool.uv]
+package = true
 
 [dependency-groups]
 dev = [
