@@ -127,7 +127,7 @@ class ACPDeepAgent(ACPAgent):
             session_id=uuid4().hex,
             modes=SessionModeState(
                 available_modes=available_modes,
-                current_mode_id="ask_before_edits",
+                current_mode_id=self._mode,
             ),
         )
 
@@ -155,7 +155,7 @@ class ACPDeepAgent(ACPAgent):
             interrupt_on=interrupt_config,
         )
 
-        self._current_mode = mode_id
+        self._mode = mode_id
 
         return SetSessionModeResponse()
 
