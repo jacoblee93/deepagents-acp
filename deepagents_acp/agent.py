@@ -543,11 +543,18 @@ class ACPDeepAgent(ACPAgent):
                     # Handle the user's decision
                     if response.outcome.outcome == "selected":
                         decision_type = response.outcome.option_id
-                        user_decisions.append({"type": decision_type})
-                        
-                        # If rejecting a plan, clear it
+
+                        # If rejecting a plan, clear it and provide feedback
                         if tool_name == "write_todos" and decision_type == "reject":
                             await self._clear_plan(session_id)
+                            user_decisions.append(
+                                {
+                                    "type": decision_type,
+                                    "feedback": "The plan was rejected. Please create a new, improved plan using write_todos.",
+                                }
+                            )
+                        else:
+                            user_decisions.append({"type": decision_type})
                     else:
                         # User cancelled, treat as rejection
                         user_decisions.append({"type": "reject"})
