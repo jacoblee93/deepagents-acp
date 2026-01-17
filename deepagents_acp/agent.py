@@ -550,7 +550,7 @@ class ACPDeepAgent(ACPAgent):
                             user_decisions.append(
                                 {
                                     "type": decision_type,
-                                    "feedback": "The plan was rejected. Please create a new, improved plan using write_todos.",
+                                    "feedback": "The plan was rejected. Please ask the user for feedback on how the plan can be improved, then create a new, better plan using write_todos.",
                                 }
                             )
                         else:
