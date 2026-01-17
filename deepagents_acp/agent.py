@@ -103,6 +103,7 @@ class ACPDeepAgent(ACPAgent):
         self._checkpointer = checkpointer
         self._mode = mode
         self._deepagent = self._create_deepagent(mode)
+        self._cancelled = False
         super().__init__()
 
     def on_connect(self, conn: Client) -> None:
@@ -164,6 +165,10 @@ class ACPDeepAgent(ACPAgent):
         self._mode = mode_id
 
         return SetSessionModeResponse()
+
+    async def cancel(self, session_id: str, **kwargs: Any) -> None:
+        """Cancel the current execution."""
+        self._cancelled = True
 
     async def _log_text(self, session_id: str, text: str):
         update = update_agent_message(text_block(text))
@@ -389,6 +394,9 @@ class ACPDeepAgent(ACPAgent):
         session_id: str,
         **kwargs: Any,
     ) -> PromptResponse:
+        # Reset cancellation flag for new prompt
+        self._cancelled = False
+
         # Convert ACP content blocks to LangChain multimodal content format
         content_blocks = []
 
@@ -420,6 +428,11 @@ class ACPDeepAgent(ACPAgent):
         user_decisions = []
 
         while current_state is None or current_state.interrupts:
+            # Check for cancellation
+            if self._cancelled:
+                self._cancelled = False  # Reset for next prompt
+                return PromptResponse(stop_reason="cancelled")
+
             async for message_chunk, metadata in self._deepagent.astream(
                 Command(resume={"decisions": user_decisions})
                 if user_decisions
@@ -427,6 +440,11 @@ class ACPDeepAgent(ACPAgent):
                 config=config,
                 stream_mode="messages",
             ):
+                # Check for cancellation during streaming
+                if self._cancelled:
+                    self._cancelled = False  # Reset for next prompt
+                    return PromptResponse(stop_reason="cancelled")
+
                 # Process tool call chunks
                 await self._process_tool_call_chunks(
                     session_id,
