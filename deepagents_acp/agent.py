@@ -69,24 +69,24 @@ class ACPDeepAgent(ACPAgent):
     _mode: str
 
     @staticmethod
-    def _get_interrupt_config(mode_id: str):
+    def _get_interrupt_config(mode_id: str) -> dict:
         """Get interrupt configuration for a given mode"""
         mode_to_interrupt = {
             "ask_before_edits": {
                 "edit_file": {"allowed_decisions": ["approve", "reject"]},
                 "write_file": {"allowed_decisions": ["approve", "reject"]},
+                "write_todos": {"allowed_decisions": ["approve", "reject"]},
             },
-            "auto": None,  # No interrupts, full auto
-            "plan": {
-                # Interrupt after write_todos to review the plan
+            "auto": {
                 "write_todos": {"allowed_decisions": ["approve", "reject"]},
             },
         }
-        return mode_to_interrupt.get(mode_id)
+        return mode_to_interrupt.get(mode_id, {})
 
     def _create_deepagent(self, mode: str):
         """Create a DeepAgent with the appropriate configuration for the given mode"""
         interrupt_config = self._get_interrupt_config(mode)
+
         return create_deep_agent(
             checkpointer=self._checkpointer,
             backend=FilesystemBackend(root_dir=self._root_dir, virtual_mode=True),
@@ -140,13 +140,8 @@ class ACPDeepAgent(ACPAgent):
             ),
             SessionMode(
                 id="auto",
-                name="Full Auto",
-                description="Never ask for permission",
-            ),
-            SessionMode(
-                id="plan",
-                name="Plan Mode",
-                description="Create a plan first, then execute after approval",
+                name="Accept edits",
+                description="Auto-accept edit operations",
             ),
         ]
 
@@ -549,7 +544,7 @@ class ACPDeepAgent(ACPAgent):
                     if response.outcome.outcome == "selected":
                         decision_type = response.outcome.option_id
                         user_decisions.append({"type": decision_type})
-
+                        
                         # If rejecting a plan, clear it
                         if tool_name == "write_todos" and decision_type == "reject":
                             await self._clear_plan(session_id)
