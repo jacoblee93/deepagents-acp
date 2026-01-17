@@ -22,6 +22,7 @@ from acp import (
 from acp.interfaces import Client
 from acp.schema import (
     AgentCapabilities,
+    AgentPlanUpdate,
     AudioContentBlock,
     ClientCapabilities,
     EmbeddedResourceContentBlock,
@@ -30,6 +31,7 @@ from acp.schema import (
     Implementation,
     McpServerStdio,
     PermissionOption,
+    PlanEntry,
     PromptCapabilities,
     ResourceContentBlock,
     SessionMode,
@@ -66,21 +68,41 @@ class ACPDeepAgent(ACPAgent):
     _checkpointer: Checkpointer
     _mode: str
 
+    @staticmethod
+    def _get_interrupt_config(mode_id: str):
+        """Get interrupt configuration for a given mode"""
+        mode_to_interrupt = {
+            "ask_before_edits": {
+                "edit_file": {"allowed_decisions": ["approve", "reject"]},
+                "write_file": {"allowed_decisions": ["approve", "reject"]},
+            },
+            "auto": None,  # No interrupts, full auto
+            "plan": {
+                # Interrupt after write_todos to review the plan
+                "write_todos": {"allowed_decisions": ["approve", "reject"]},
+            },
+        }
+        return mode_to_interrupt.get(mode_id)
+
+    def _create_deepagent(self, mode: str):
+        """Create a DeepAgent with the appropriate configuration for the given mode"""
+        interrupt_config = self._get_interrupt_config(mode)
+        return create_deep_agent(
+            checkpointer=self._checkpointer,
+            backend=FilesystemBackend(root_dir=self._root_dir, virtual_mode=True),
+            interrupt_on=interrupt_config,
+        )
+
     def __init__(
         self,
         root_dir: str,
         checkpointer: Checkpointer,
         mode: str,
-        interrupt_config: dict,
     ):
         self._root_dir = root_dir
         self._checkpointer = checkpointer
         self._mode = mode
-        self._deepagent = create_deep_agent(
-            checkpointer=checkpointer,
-            backend=FilesystemBackend(root_dir=root_dir, virtual_mode=True),
-            interrupt_on=interrupt_config,
-        )
+        self._deepagent = self._create_deepagent(mode)
         super().__init__()
 
     def on_connect(self, conn: Client) -> None:
@@ -121,6 +143,11 @@ class ACPDeepAgent(ACPAgent):
                 name="Full Auto",
                 description="Never ask for permission",
             ),
+            SessionMode(
+                id="plan",
+                name="Plan Mode",
+                description="Create a plan first, then execute after approval",
+            ),
         ]
 
         return NewSessionResponse(
@@ -137,24 +164,8 @@ class ACPDeepAgent(ACPAgent):
         session_id: str,
         **kwargs: Any,
     ) -> SetSessionModeResponse:
-        # Map mode IDs to interrupt configurations
-        mode_to_interrupt = {
-            "ask_before_edits": {
-                "edit_file": {"allowed_decisions": ["approve", "reject"]},
-                "write_file": {"allowed_decisions": ["approve", "reject"]},
-            },
-            "auto": None,  # No interrupts, full auto
-        }
-
-        interrupt_config = mode_to_interrupt.get(mode_id)
-
-        # Recreate the deep agent with new interrupt config
-        self._deepagent = create_deep_agent(
-            checkpointer=self._checkpointer,
-            backend=FilesystemBackend(root_dir=self._root_dir, virtual_mode=True),
-            interrupt_on=interrupt_config,
-        )
-
+        # Recreate the deep agent with new mode configuration
+        self._deepagent = self._create_deepagent(mode_id)
         self._mode = mode_id
 
         return SetSessionModeResponse()
@@ -164,6 +175,71 @@ class ACPDeepAgent(ACPAgent):
         await self._conn.session_update(
             session_id=session_id, update=update, source="DeepAgent"
         )
+
+    async def _clear_plan(self, session_id: str) -> None:
+        """Clear the plan by sending an empty plan update.
+
+        Args:
+            session_id: The session ID
+        """
+        update = AgentPlanUpdate(
+            session_update="plan",
+            entries=[],
+        )
+        await self._conn.session_update(
+            session_id=session_id,
+            update=update,
+            source="DeepAgent",
+        )
+
+    async def _handle_todo_update(
+        self,
+        session_id: str,
+        todos: list[dict[str, Any]],
+    ) -> None:
+        """Handle todo list updates from write_todos tool.
+
+        Args:
+            session_id: The session ID
+            todos: List of todo dictionaries with 'content' and 'status' fields
+        """
+        # Convert todos to PlanEntry objects
+        entries = []
+        for todo in todos:
+            # Extract fields from todo dict
+            content = todo.get("content", "")
+            status = todo.get("status", "pending")
+
+            # Validate and cast status to PlanEntryStatus
+            if status not in ("pending", "in_progress", "completed"):
+                status = "pending"
+
+            # Create PlanEntry with default priority of "medium"
+            entry = PlanEntry(
+                content=content,
+                status=status,  # type: ignore
+                priority="medium",
+            )
+            entries.append(entry)
+
+        # Send plan update notification
+        update = AgentPlanUpdate(
+            session_update="plan",
+            entries=entries,
+        )
+        await self._conn.session_update(
+            session_id=session_id,
+            update=update,
+            source="DeepAgent",
+        )
+
+        # Also send a visible text message showing the plan
+        plan_text = "## Plan\n\n"
+        for i, todo in enumerate(todos, 1):
+            content = todo.get("content", "")
+            plan_text += f"{i}. {content}\n"
+
+        await self._log_text(session_id=session_id, text=plan_text)
 
     async def _process_tool_call_chunks(
         self,
@@ -211,8 +287,11 @@ class ACPDeepAgent(ACPAgent):
                     try:
                         tool_args = json.loads(args_str)
 
-                        # Mark as started
-                        active_tool_calls[tool_id] = {"name": tool_name}
+                        # Mark as started and store args for later reference
+                        active_tool_calls[tool_id] = {
+                            "name": tool_name,
+                            "args": tool_args,
+                        }
 
                         # Create the appropriate tool call update
                         update = self._create_tool_call_update(
@@ -224,6 +303,11 @@ class ACPDeepAgent(ACPAgent):
                             update=update,
                             source="DeepAgent",
                         )
+
+                        # If this is write_todos, send the plan update immediately
+                        if tool_name == "write_todos" and isinstance(tool_args, dict):
+                            todos = tool_args.get("todos", [])
+                            await self._handle_todo_update(session_id, todos)
                     except json.JSONDecodeError:
                         pass
 
@@ -312,6 +396,7 @@ class ACPDeepAgent(ACPAgent):
     ) -> PromptResponse:
         # Convert ACP content blocks to LangChain multimodal content format
         content_blocks = []
+
         for block in prompt:
             if isinstance(block, TextContentBlock):
                 content_blocks.extend(convert_text_block_to_content_blocks(block))
@@ -395,13 +480,15 @@ class ACPDeepAgent(ACPAgent):
             # Check if the agent is interrupted (waiting for HITL approval)
             current_state = await self._deepagent.aget_state(config)
             user_decisions = await self._handle_interrupts(
-                current_state=current_state, session_id=session_id
+                current_state=current_state,
+                session_id=session_id,
+                active_tool_calls=active_tool_calls,
             )
 
         return PromptResponse(stop_reason="end_turn")
 
     async def _handle_interrupts(
-        self, *, current_state: StateSnapshot, session_id: str
+        self, *, current_state: StateSnapshot, session_id: str, active_tool_calls: dict
     ):
         user_decisions = []
         if current_state.next and current_state.interrupts:
@@ -411,58 +498,68 @@ class ACPDeepAgent(ACPAgent):
                 tool_call_id = interrupt.id
                 interrupt_value = interrupt.value
 
-                # Extract tool information from interrupt value
-                tool_name = (
-                    interrupt_value.get("name", "tool")
-                    if isinstance(interrupt_value, dict)
-                    else "tool"
-                )
-                tool_args = (
-                    interrupt_value.get("args", {})
-                    if isinstance(interrupt_value, dict)
-                    else {}
-                )
+                # Extract action requests from interrupt_value
+                action_requests = []
+                if isinstance(interrupt_value, dict):
+                    # DeepAgents wraps tool calls in action_requests
+                    action_requests = interrupt_value.get("action_requests", [])
 
-                # Create a title for the permission request
-                if tool_name == "edit_file" and isinstance(tool_args, dict):
-                    file_path = tool_args.get("file_path", "file")
-                    title = f"Edit `{file_path}`"
-                elif tool_name == "write_file" and isinstance(tool_args, dict):
-                    file_path = tool_args.get("file_path", "file")
-                    title = f"Write `{file_path}`"
-                else:
-                    title = tool_name
+                # Process each action request
+                for action in action_requests:
+                    tool_name = action.get("name", "tool")
+                    tool_args = action.get("args", {})
 
-                # Create permission options
-                options = [
-                    PermissionOption(
-                        option_id="approve",
-                        name="Approve",
-                        kind="allow_once",
-                    ),
-                    PermissionOption(
-                        option_id="reject",
-                        name="Reject",
-                        kind="reject_once",
-                    ),
-                ]
+                    # Create a title for the permission request
+                    if tool_name == "write_todos":
+                        title = "Review Plan"
+                    elif tool_name == "edit_file" and isinstance(tool_args, dict):
+                        file_path = tool_args.get("file_path", "file")
+                        title = f"Edit `{file_path}`"
+                    elif tool_name == "write_file" and isinstance(tool_args, dict):
+                        file_path = tool_args.get("file_path", "file")
+                        title = f"Write `{file_path}`"
+                    else:
+                        title = tool_name
 
-                # Request permission from the client
-                tool_call_update = ToolCallUpdate(
-                    tool_call_id=tool_call_id,
-                    title=title,
-                )
-                response = await self._conn.request_permission(
-                    session_id=session_id,
-                    tool_call=tool_call_update,
-                    options=options,
-                )
-                # Handle the user's decision
-                if response.outcome.outcome == "selected":
-                    user_decisions.append({"type": response.outcome.option_id})
-                else:
-                    # User cancelled, treat as rejection
-                    user_decisions.append({"type": "reject"})
+                    # Create permission options
+                    options = [
+                        PermissionOption(
+                            option_id="approve",
+                            name="Approve",
+                            kind="allow_once",
+                        ),
+                        PermissionOption(
+                            option_id="reject",
+                            name="Reject",
+                            kind="reject_once",
+                        ),
+                    ]
+
+                    # Request permission from the client
+                    tool_call_update = ToolCallUpdate(
+                        tool_call_id=tool_call_id,
+                        title=title,
+                    )
+                    response = await self._conn.request_permission(
+                        session_id=session_id,
+                        tool_call=tool_call_update,
+                        options=options,
+                    )
+                    # Handle the user's decision
+                    if response.outcome.outcome == "selected":
+                        decision_type = response.outcome.option_id
+                        user_decisions.append({"type": decision_type})
+
+                        # If rejecting a plan, clear it
+                        if tool_name == "write_todos" and decision_type == "reject":
+                            await self._clear_plan(session_id)
+                    else:
+                        # User cancelled, treat as rejection
+                        user_decisions.append({"type": "reject"})
+
+                        # If cancelling a plan, clear it
+                        if tool_name == "write_todos":
+                            await self._clear_plan(session_id)
             return user_decisions
 
 
@@ -472,21 +569,9 @@ async def run_agent(root_dir: str) -> None:
     # Start with ask_before_edits mode (ask before edits)
     mode_id = "ask_before_edits"
 
-    # Configure interrupt based on mode
-    mode_to_interrupt = {
-        "ask_before_edits": {
-            "edit_file": {"allowed_decisions": ["approve", "reject"]},
-            "write_file": {"allowed_decisions": ["approve", "reject"]},
-        },
-        "auto": None,  # No interrupts, full auto
-    }
-
-    interrupt_config = mode_to_interrupt.get(mode_id)
-
     acp_agent = ACPDeepAgent(
         root_dir=root_dir,
         mode=mode_id,
         checkpointer=checkpointer,
-        interrupt_config=interrupt_config,
     )
     await run_acp_agent(acp_agent)
